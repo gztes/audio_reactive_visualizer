@@ -1,0 +1,13 @@
+# Dependencies (none needed — CDN based — but just in case)
+node_modules/
+package-lock.json
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Logs
+*.log

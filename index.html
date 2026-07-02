@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Audio Reactive Visualizer</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #05060f; }
+    canvas { display: block; }
+
+    /* Animated gradient backdrop, rendered in CSS behind the transparent WebGL canvas. */
+    #bgGradient {
+      position: fixed; inset: 0; z-index: -1;
+      background:
+        radial-gradient(ellipse 80% 60% at 30% 20%, #1a0b3d 0%, transparent 60%),
+        radial-gradient(ellipse 70% 70% at 75% 75%, #0b2a4a 0%, transparent 55%),
+        radial-gradient(ellipse 100% 100% at 50% 50%, #0a0618 0%, #05060f 100%);
+      animation: drift 18s ease-in-out infinite alternate;
+    }
+    @keyframes drift {
+      0%   { filter: hue-rotate(0deg)   saturate(1);   transform: scale(1);    }
+      100% { filter: hue-rotate(40deg)  saturate(1.3); transform: scale(1.08); }
+    }
+
+    #ui {
+      position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+      display: flex; flex-direction: column; align-items: center; gap: 12px; z-index: 10;
+    }
+    .btn {
+      padding: 14px 30px; font: 500 15px system-ui, sans-serif;
+      border: none; border-radius: 10px; cursor: pointer;
+      backdrop-filter: blur(10px); transition: transform .15s, opacity .15s;
+    }
+    #micBtn  { background: rgba(120, 200, 255, 0.9); color: #05060f; }
+    #demoBtn { background: rgba(255,255,255,0.06); color: #9fd8ff; border: 1px solid rgba(159,216,255,0.4); }
+    .btn:hover { transform: translateY(-2px); opacity: 0.9; }
+
+    #statusText {
+      position: fixed; top: 58%; left: 50%; transform: translate(-50%, 0);
+      font: 400 13px system-ui, sans-serif; color: #7a8aa0; z-index: 10; display: none;
+    }
+    #modeLabel {
+      position: fixed; top: 18px; left: 50%; transform: translateX(-50%);
+      font: 400 12px system-ui, sans-serif; color: #4a5568;
+      letter-spacing: 0.08em; text-transform: uppercase; z-index: 10; display: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="bgGradient"></div>
+  <div id="ui">
+    <button class="btn" id="micBtn">🎙 Enable microphone</button>
+    <button class="btn" id="demoBtn">▶ Demo mode (no mic)</button>
+  </div>
+  <div id="statusText">Calibrating to room noise — stay quiet...</div>
+  <div id="modeLabel"></div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.163/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.163/examples/jsm/",
+      "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19/dist/lil-gui.esm.js"
+    }
+  }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    import { EffectComposer }  from 'three/addons/postprocessing/EffectComposer.js';
+    import { RenderPass }      from 'three/addons/postprocessing/RenderPass.js';
+    import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+    import GUI from 'lil-gui';
+
+    // ─── Renderer ────────────────────────────────────────────────────────────
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setClearColor(0x000000, 0); // transparent -> CSS gradient shows through
+    document.body.appendChild(renderer.domElement);
+
+    const scene  = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.z = 9;
+
+    // ─── Bloom post-processing ────────────────────────────────────────────────
+    const composer = new EffectComposer(renderer);
+    composer.addPass(new RenderPass(scene, camera));
+    const bloomPass = new UnrealBloomPass(
+      new THREE.Vector2(window.innerWidth, window.innerHeight),
+      0.9,  // strength
+      0.5,  // radius
+      0.15  // threshold
+    );
+    composer.addPass(bloomPass);
+
+    // ─── Tweakable params (single source of truth for the GUI) ────────────────
+    const params = {
+      bloomStrength: 0.9, bloomRadius: 0.5, bloomThreshold: 0.15,
+      spinSpeed: 0.04, tiltAmount: 0.15, reactivity: 1.3,
+      smoothing: 0.25, domeDepth: 1.2,
+      colorQuiet: '#26187a', colorLow: '#3390f2', colorMid: '#4df2e6', colorLoud: '#ff59d9',
+      glowBoost: 1.6,
+    };
+
+    const hexToRgb = (hex) => {
+      const n = parseInt(hex.slice(1), 16);
+      return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+    };
+
+    let paletteStops = [];
+    const rebuildPalette = () => {
+      paletteStops = [
+        hexToRgb(params.colorQuiet), hexToRgb(params.colorLow),
+        hexToRgb(params.colorMid),   hexToRgb(params.colorLoud),
+      ];
+    };
+    rebuildPalette();
+
+    const palette = (t) => {
+      const scaled = t * (paletteStops.length - 1);
+      const i = Math.min(paletteStops.length - 2, Math.floor(scaled));
+      const f = scaled - i;
+      return [
+        paletteStops[i][0] + (paletteStops[i+1][0] - paletteStops[i][0]) * f,
+        paletteStops[i][1] + (paletteStops[i+1][1] - paletteStops[i][1]) * f,
+        paletteStops[i][2] + (paletteStops[i+1][2] - paletteStops[i][2]) * f,
+      ];
+    };
+
+    // ─── Full-disc particle field ─────────────────────────────────────────────
+    // Concentric rings fill the disc; outer rings hold more particles (so density
+    // stays even) and map to higher frequencies. Inner rings = bass.
+    const RING_COUNT = 26;
+    const layout = [];
+    for (let r = 0; r < RING_COUNT; r++) {
+      const ringT = r / (RING_COUNT - 1);
+      const countThisRing = Math.floor(8 + ringT * 90);
+      for (let a = 0; a < countThisRing; a++) {
+        layout.push({
+          angle: (a / countThisRing) * Math.PI * 2,
+          ringT,
+          binIndex: Math.min(1023, Math.floor(Math.pow(1024, ringT * 0.9 + (a / countThisRing) * 0.1))),
+        });
+      }
+    }
+    const P = layout.length;
+
+    const positions = new Float32Array(P * 3);
+    const colors    = new Float32Array(P * 3);
+    const sizes     = new Float32Array(P);
+
+    const MAX_RADIUS = 4.2;
+    for (let i = 0; i < P; i++) {
+      const { angle, ringT } = layout[i];
+      const radius = ringT * MAX_RADIUS;
+      positions[i*3]   = Math.cos(angle) * radius;
+      positions[i*3+1] = Math.sin(angle) * radius;
+      positions[i*3+2] = 0;
+      sizes[i] = 0.02 + (1 - ringT) * 0.04;
+      // Base colour so the disc is visible from frame 0 (before any interaction).
+      colors[i*3]   = 0.15 + ringT * 0.25;
+      colors[i*3+1] = 0.45 + ringT * 0.35;
+      colors[i*3+2] = 0.85;
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute('color',    new THREE.BufferAttribute(colors, 3));
+    geo.setAttribute('size',     new THREE.BufferAttribute(sizes, 1));
+
+    // Custom shader: soft, round, additively-blended glowing points.
+    const mat = new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, vertexColors: true,
+      uniforms: { uPixelRatio: { value: Math.min(window.devicePixelRatio, 2) } },
+      vertexShader: `
+        attribute float size;
+        varying vec3 vColor;
+        uniform float uPixelRatio;
+        void main() {
+          vColor = color;
+          vec4 mv = modelViewMatrix * vec4(position, 1.0);
+          gl_PointSize = size * 300.0 * uPixelRatio / -mv.z;
+          gl_Position = projectionMatrix * mv;
+        }
+      `,
+      fragmentShader: `
+        varying vec3 vColor;
+        void main() {
+          float d = length(gl_PointCoord - vec2(0.5));
+          float alpha = smoothstep(0.5, 0.0, d);
+          gl_FragColor = vec4(vColor, alpha);
+        }
+      `,
+    });
+
+    const points = new THREE.Points(geo, mat);
+    scene.add(points);
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      composer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ─── Audio state ─────────────────────────────────────────────────────────
+    let analyser = null, freqData = null, demoMode = false;
+    const CALIBRATION_MS = 1200;
+    let calibrating = false, calibrationStart = 0;
+    const noiseFloor = new Float32Array(1024);
+
+    document.getElementById('micBtn').addEventListener('click', async () => {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        alert('Microphone API unavailable here. Open this file directly in Chrome/Firefox (not an embedded preview).');
+        return;
+      }
+      try {
+        const stream   = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const source   = audioCtx.createMediaStreamSource(stream);
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 2048;               // 1024 usable bins
+        analyser.smoothingTimeConstant = 0.78; // built-in temporal smoothing
+        source.connect(analyser);              // NOT connected to destination -> no feedback
+        freqData = new Uint8Array(analyser.frequencyBinCount);
+        document.getElementById('ui').style.display = 'none';
+        document.getElementById('statusText').style.display = 'block';
+        const label = document.getElementById('modeLabel');
+        label.textContent = 'Mic active'; label.style.display = 'block';
+        noiseFloor.fill(0);
+        calibrating = true; calibrationStart = performance.now();
+      } catch (err) { alert(`Mic failed: ${err.name} — ${err.message}`); }
+    });
+
+    document.getElementById('demoBtn').addEventListener('click', () => {
+      demoMode = true;
+      document.getElementById('ui').style.display = 'none';
+      const label = document.getElementById('modeLabel');
+      label.textContent = 'Demo mode'; label.style.display = 'block';
+    });
+
+    // ─── Render loop ─────────────────────────────────────────────────────────
+    const posAttr   = geo.attributes.position;
+    const colorAttr = geo.attributes.color;
+    const clock     = new THREE.Clock();
+    const binAmp    = new Float32Array(P);
+
+    // 0..1 amplitude per FFT bin. Demo synthesises a wave; mic reads gated data; idle = 0.
+    function getAmplitudeForBin(bin, elapsed, ringT, angle) {
+      if (demoMode) {
+        const wave =
+          Math.sin(elapsed * 2.1 + ringT * 6.0 + angle * 2.0) * 0.3 +
+          Math.sin(elapsed * 3.3 + angle * 3.0)               * 0.2 +
+          Math.abs(Math.sin(elapsed * 1.4))                    * 0.5;
+        return Math.max(0, wave * 0.5 + 0.35);
+      }
+      if (analyser) {
+        const raw   = freqData[bin] / 255;
+        const floor = noiseFloor[bin];
+        const gated = Math.max(0, raw - floor) / Math.max(0.01, 1 - floor);
+        return Math.pow(gated, 0.5); // perceptual boost
+      }
+      return 0;
+    }
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const elapsed = clock.getElapsedTime();
+
+      if (analyser && !demoMode) {
+        analyser.getByteFrequencyData(freqData);
+        if (calibrating) {
+          for (let b = 0; b < 1024; b++) noiseFloor[b] = Math.max(noiseFloor[b], freqData[b] / 255);
+          if (performance.now() - calibrationStart > CALIBRATION_MS) {
+            calibrating = false;
+            document.getElementById('statusText').style.display = 'none';
+            for (let b = 0; b < 1024; b++) noiseFloor[b] = Math.min(noiseFloor[b] + 0.03, 0.6);
+          }
+        }
+      }
+
+      if (!calibrating) {
+        let bassSum = 0, bassN = 0;
+        for (let i = 0; i < P; i++) {
+          const { angle, ringT, binIndex } = layout[i];
+          const target = getAmplitudeForBin(binIndex, elapsed, ringT, angle);
+          binAmp[i] += (target - binAmp[i]) * params.smoothing;
+          const amp = binAmp[i];
+
+          // Ambient breathing so the disc is always alive, even in silence.
+          const ambient = 0.12 + Math.sin(elapsed * 0.8 + ringT * 5.0 + angle) * 0.06;
+          const energy = Math.max(ambient, amp);
+
+          const radius = ringT * MAX_RADIUS + energy * params.reactivity
+                       + Math.sin(elapsed * 1.5 + i * 0.3) * 0.04;
+          posAttr.setX(i, Math.cos(angle) * radius);
+          posAttr.setY(i, Math.sin(angle) * radius);
+          posAttr.setZ(i, energy * params.domeDepth);
+
+          const [cr, cg, cb] = palette(Math.min(1, energy * 0.7 + ringT * 0.35));
+          const glow = 0.7 + amp * params.glowBoost;
+          colorAttr.setXYZ(i, cr * glow, cg * glow, cb * glow);
+
+          if (ringT < 0.35) { bassSum += amp; bassN++; }
+        }
+        posAttr.needsUpdate = true;
+        colorAttr.needsUpdate = true;
+        points.scale.setScalar(1 + (bassN ? bassSum / bassN : 0) * 0.10);
+      }
+
+      points.rotation.z = elapsed * params.spinSpeed;
+      points.rotation.x = Math.sin(elapsed * 0.2) * params.tiltAmount;
+
+      composer.render();
+    }
+    animate();
+
+    // ─── GUI control panel ────────────────────────────────────────────────────
+    const gui = new GUI({ title: 'Visualizer Controls' });
+
+    const fBloom = gui.addFolder('Bloom / Glow');
+    fBloom.add(params, 'bloomStrength', 0, 3, 0.05).name('Strength').onChange(v => bloomPass.strength = v);
+    fBloom.add(params, 'bloomRadius', 0, 1, 0.01).name('Radius').onChange(v => bloomPass.radius = v);
+    fBloom.add(params, 'bloomThreshold', 0, 1, 0.01).name('Threshold').onChange(v => bloomPass.threshold = v);
+    fBloom.add(params, 'glowBoost', 0, 4, 0.1).name('Glow boost');
+
+    const fMotion = gui.addFolder('Motion');
+    fMotion.add(params, 'reactivity', 0, 4, 0.05).name('Reactivity');
+    fMotion.add(params, 'smoothing', 0.02, 1, 0.01).name('Smoothing');
+    fMotion.add(params, 'domeDepth', 0, 4, 0.1).name('Dome depth');
+    fMotion.add(params, 'spinSpeed', 0, 0.3, 0.005).name('Spin speed');
+    fMotion.add(params, 'tiltAmount', 0, 0.6, 0.01).name('Tilt');
+
+    const fColor = gui.addFolder('Colours');
+    fColor.addColor(params, 'colorQuiet').name('Quiet').onChange(rebuildPalette);
+    fColor.addColor(params, 'colorLow').name('Low').onChange(rebuildPalette);
+    fColor.addColor(params, 'colorMid').name('Mid').onChange(rebuildPalette);
+    fColor.addColor(params, 'colorLoud').name('Loud').onChange(rebuildPalette);
+    fColor.close();
+
+    const presets = {
+      'Cyberpunk': () => applyPreset({ colorQuiet:'#26187a', colorLow:'#3390f2', colorMid:'#4df2e6', colorLoud:'#ff59d9', bloomStrength:0.9 }),
+      'Inferno':   () => applyPreset({ colorQuiet:'#2a0a00', colorLow:'#ff3d00', colorMid:'#ff9100', colorLoud:'#fff59d', bloomStrength:1.3 }),
+      'Aurora':    () => applyPreset({ colorQuiet:'#012a1a', colorLow:'#00c853', colorMid:'#64ffda', colorLoud:'#e0f7fa', bloomStrength:1.1 }),
+      'Mono ice':  () => applyPreset({ colorQuiet:'#0a1a2a', colorLow:'#4a90d9', colorMid:'#a8d0f0', colorLoud:'#ffffff', bloomStrength:1.0 }),
+    };
+    function applyPreset(p) {
+      Object.assign(params, p);
+      if (p.bloomStrength !== undefined) bloomPass.strength = p.bloomStrength;
+      rebuildPalette();
+      gui.controllersRecursive().forEach(c => c.updateDisplay());
+    }
+    const fPresets = gui.addFolder('Presets');
+    Object.keys(presets).forEach(name => fPresets.add({ [name]: presets[name] }, name));
+  </script>
+</body>
+</html>
